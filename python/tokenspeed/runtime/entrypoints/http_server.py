@@ -110,6 +110,7 @@ from tokenspeed.runtime.utils.exceptions import get_exception_traceback
 from tokenspeed.runtime.utils.network import set_uvicorn_logging_configs
 from tokenspeed.runtime.utils.process import kill_process_tree
 from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.ts_trace import ts_log
 from tokenspeed.runtime.utils.warmup import execute_warmups
 from tokenspeed.version import __version__
 
@@ -785,6 +786,10 @@ async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
     """OpenAI-compatible chat completion endpoint."""
+    ts_log(
+        f"[TS][http] POST /v1/chat/completions  model={request.model}  "
+        f"messages={len(request.messages)}  stream={request.stream}"
+    )
     return await raw_request.app.state.openai_serving_chat.handle_request(
         request, raw_request
     )

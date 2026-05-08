@@ -73,6 +73,7 @@ from tokenspeed.runtime.inputs.reasoning_parser import ReasoningParser
 from tokenspeed.runtime.inputs.template_manager import TemplateManager
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 from tokenspeed.runtime.utils import convert_json_schema_to_str, get_colorful_logger
+from tokenspeed.runtime.utils.ts_trace import ts_log
 
 logger = get_colorful_logger(__name__)
 
@@ -305,6 +306,13 @@ class OpenAIServingChat(OpenAIServingBase):
             bootstrap_room=request.bootstrap_room,
             return_hidden_states=request.return_hidden_states,
             user_rid=request.rid,
+        )
+
+        ts_log(
+            f"[TS][http] _convert_to_internal_request: rid={adapted_request.rid} "
+            f"input_ids_len="
+            f"{len(adapted_request.input_ids) if adapted_request.input_ids else None} "
+            f"sampling={sampling_params}"
         )
 
         return adapted_request, request
@@ -711,6 +719,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
         try:
             async for content in self.engine_client.generate_request(adapted_request):
+                ts_log(
+                    f"[TS][http] SSE rid={content['meta_info'].get('id', '?')} "
+                    f"text_len={len(content.get('text', ''))} "
+                    f"finish={(content['meta_info'].get('finish_reason') or {}).get('type')}"
+                )
                 index = content.get("index", 0)
 
                 prompt_tokens[index] = content["meta_info"]["prompt_tokens"]

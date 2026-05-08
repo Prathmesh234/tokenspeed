@@ -58,6 +58,7 @@ from tokenspeed.runtime.utils import broadcast_pyobj
 from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import get_tokenizer
+from tokenspeed.runtime.utils.ts_trace import ts_log
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -140,6 +141,10 @@ class RequestHandler:
                     recv_req = self.recv_func.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
+                ts_log(
+                    f"[TS][sched] recv kind={type(recv_req).__name__} "
+                    f"rid={getattr(recv_req, 'rid', '?')}"
+                )
                 recv_reqs.append(recv_req)
         else:
             recv_reqs = None
@@ -232,6 +237,11 @@ class RequestHandler:
                 else 1 << 30
             ),
             self.max_req_len - len(req_state.prompt_input_ids) - 1,
+        )
+        ts_log(
+            f"[TS][sched] handoff to C++ rid={req_spec.request_id} "
+            f"prompt_tokens={len(recv_req.input_ids)} "
+            f"max_new_tokens={req_state.sampling_params.max_new_tokens}"
         )
         return (
             req_spec,

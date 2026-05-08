@@ -9,11 +9,16 @@ back.
 All file paths below are relative to the repo root
 `/Users/prathmeshbhatt/Desktop/tokenspeed`.
 
-> **Print convention.** Every print statement in this doc uses the prefix
-> `[TS]` followed by a tag like `[TS][http]`, `[TS][async]`, `[TS][sched]`,
-> `[TS][exec]`, `[TS][model]`, `[TS][attn]`, `[TS][triton]`, `[TS][sampler]`,
-> `[TS][output]`. After running, you can `grep -E "^\[TS\]"` your log and
-> reconstruct a timeline.
+> **Print convention.** Every print statement in this doc goes through
+> `ts_log(...)` from `tokenspeed.runtime.utils.ts_trace`, which is a
+> one-line wrapper around `print(..., flush=True)` gated on the
+> `TS_TRACE` environment variable (default off, set `TS_TRACE=1` to
+> enable). Tags follow `[TS][<layer>][<sub>]` — e.g. `[TS][http]`,
+> `[TS][async]`, `[TS][sched]`, `[TS][exec]`, `[TS][model]`,
+> `[TS][attn]`, `[TS][triton]`, `[TS][sampler]`, `[TS][output]`. After
+> running, you can `grep -E "^\[TS\]"` your log and reconstruct a
+> timeline. Inside `@triton.jit` kernels we use `tl.device_print`
+> instead — see § 4.4.
 
 ---
 
@@ -198,17 +203,49 @@ The bindings live in `tokenspeed-scheduler/bindings/python_module.cpp`.
 
 ---
 
-## 4. End-to-end trace of one HTTP request
+## 4. Print-trace plan, organized by layer
 
-This is the canonical journey we'll instrument. Each phase has:
+The print-trace plan is split into **four layers**, matching how
+TokenSpeed's stack is composed. Add prints layer by layer, verify the
+trace, then move on to the next.
+
+| Layer | What it owns | Files (representative) |
+|---|---|---|
+| **4.1 Engine** | HTTP intake, frontend `AsyncLLM`, scheduler process, FSM ticks, output return path | `entrypoints/`, `engine/async_llm.py`, `engine/event_loop.py`, `engine/request_handler.py`, `engine/output_processor.py` |
+| **4.2 Runtime** | `ModelExecutor`, `InputBuffers`, CUDA-graph replay, kernel registry, sampling backend — the glue between scheduler plan and model forward | `execution/model_executor.py`, `execution/input_buffer.py`, `execution/cuda_graph_wrapper.py`, `tokenspeed_kernel/selection.py`, `sampling/backends/` |
+| **4.3 Model** | `ModelRunner.forward`, decoder layers, MLP, the `PagedAttention` wrapper, `LogitsProcessor` | `execution/model_runner.py`, `models/llama.py`, `layers/paged_attention.py`, `layers/logits_processor.py` |
+| **4.4 Kernel** | Attention backend dispatch, Triton wrappers, `@triton.jit` kernels, `tl.device_print` | `layers/attention/backends/base.py`, `layers/attention/backends/triton.py`, `tokenspeed-kernel/.../ops/attention/triton/` |
+
+**The 10 phases from the previous version of this doc are preserved as
+cross-references** (1.x, 2.x, ..., 10.x). Only the **grouping** has
+changed — phases now sit under whichever layer they instrument. PHASE 10
+straddles three layers and is split: 10.1 lives in § 4.3, 10.2 lives in
+§ 4.2, and 10.3-10.6 live in § 4.1.
+
+Per-tick prints (§ 4.1 Phase 4) and per-step prints (§ 4.2, § 4.3, § 4.4)
+fire on every scheduler iteration. Set `TS_TRACE=1` to enable them; leave
+the variable unset for production runs and the `ts_log(...)` calls become
+a single boolean test on a module-level flag.
+
+Each phase below carries:
 
 - **What it does** — one paragraph
 - **File & function** — exact location to read first
-- **Where to print** — the line you'll insert a `print(...)` on
+- **Where to print** — the line you'll insert a `ts_log(...)` on
 - **What you'll learn** — what the print confirms
 
-We'll instrument **all 10 phases**, producing one line per phase per token.
-At the end you have a complete cycle log per generated token.
+---
+
+### 4.1 Engine layer
+
+The control plane: HTTP intake, frontend tokenizer, ZMQ handoff, the
+scheduler-process tick (`event_loop`) including the C++ FSM call, and
+the output return path back to the SSE stream.
+
+**Phases:** 1, 2, 3, 4, plus 10.3-10.6 (the engine half of phase 10).
+
+**Status:** these prints are wired into the source. Set `TS_TRACE=1` to
+enable; see § 8 for a launch recipe.
 
 ---
 
@@ -223,9 +260,8 @@ The user sends a `POST /v1/chat/completions` to FastAPI.
 **Print 1.1** — at the top of the route handler:
 
 ```python
-print(f"[TS][http] POST /v1/chat/completions  model={request.model}  "
-      f"messages={len(request.messages)}  stream={request.stream}",
-      flush=True)
+ts_log(f"[TS][http] POST /v1/chat/completions  model={request.model}  "
+      f"messages={len(request.messages)}  stream={request.stream}")
 ```
 
 **Print 1.2** — in
@@ -233,9 +269,9 @@ print(f"[TS][http] POST /v1/chat/completions  model={request.model}  "
 `_convert_to_internal_request`, after the `GenerateReqInput` is built:
 
 ```python
-print(f"[TS][http] _convert_to_internal_request: rid={adapted.rid} "
+ts_log(f"[TS][http] _convert_to_internal_request: rid={adapted.rid} "
       f"input_ids_len={len(adapted.input_ids) if adapted.input_ids else None} "
-      f"sampling={sampling_params}", flush=True)
+      f"sampling={sampling_params}")
 ```
 
 > **What you'll see:** the OpenAI request landing, getting a `rid` (request
@@ -256,24 +292,25 @@ The frontend's `AsyncLLM.generate_request` is the single chokepoint where
 **Print 2.1** — top of `AsyncLLM.generate_request`:
 
 ```python
-print(f"[TS][async] generate_request rid={obj.rid} prompt_len="
-      f"{len(obj.input_ids) if obj.input_ids else len(obj.text or '')}",
-      flush=True)
+ts_log(f"[TS][async] generate_request rid={obj.rid} prompt_len="
+      f"{len(obj.input_ids) if obj.input_ids else len(obj.text or '')}")
 ```
 
 **Print 2.2** — inside `_tokenize_one_request` (line ~303):
 
 ```python
-print(f"[TS][async] tokenized rid={obj.rid} -> "
+ts_log(f"[TS][async] tokenized rid={obj.rid} -> "
       f"{len(tokenized.input_ids)} tokens, "
-      f"first5={tokenized.input_ids[:5]}", flush=True)
+      f"first5={tokenized.input_ids[:5]}")
 ```
 
 **Print 2.3** — inside `_send_one_request` just before
 `send_to_scheduler.send_pyobj(...)`:
 
 ```python
-print(f"[TS][async] PUSH rid={tokenized.rid} -> scheduler ZMQ", flush=True)
+ts_log(
+    f"[TS][async] PUSH rid={tokenized.rid} -> scheduler ZMQ"
+)
 ```
 
 > **What you'll see:** prompt → tokens, then the handoff over ZMQ. After
@@ -295,31 +332,36 @@ rank 0 talks to ZMQ), then hands to the C++ scheduler.
 **Print 3.1** — top of `EventLoop._process_new_requests`:
 
 ```python
-print(f"[TS][sched] poll new reqs (rank={self.tp_rank})", flush=True)
+ts_log(f"[TS][sched] poll new reqs (attn_tp_rank={self.attn_tp_rank})")
 ```
 
 **Print 3.2** — in `RequestHandler.recv_reqs` after a request is received
 (line ~140):
 
 ```python
-print(f"[TS][sched] recv rid={req.rid} state=WAITING "
-      f"prompt_tokens={len(req.input_ids)}", flush=True)
+ts_log(
+    f"[TS][sched] recv kind={type(recv_req).__name__} "
+    f"rid={getattr(recv_req, 'rid', '?')}"
+)
 ```
 
 **Print 3.3** — in `RequestHandler.handle_generate_request` after the
-`RequestSpec` is built:
+`RequestSpec` and `RequestState` are built:
 
 ```python
-print(f"[TS][sched] handoff to C++ rid={spec.id} "
-      f"max_new_tokens={spec.sampling_params.max_new_tokens}", flush=True)
+ts_log(
+    f"[TS][sched] handoff to C++ rid={req_spec.request_id} "
+    f"prompt_tokens={len(recv_req.input_ids)} "
+    f"max_new_tokens={req_state.sampling_params.max_new_tokens}"
+)
 ```
 
 **Print 3.4** — in `_process_new_requests` after
 `scheduler.submit_requests(...)`:
 
 ```python
-print(f"[TS][sched] C++ Scheduler.SubmitRequests batch={len(specs)} "
-      f"waiting_size_now={self.scheduler.waiting_size()}", flush=True)
+ts_log(f"[TS][sched] C++ Scheduler.SubmitRequests batch={len(specs)} "
+      f"waiting_size_now={self.scheduler.waiting_size()}")
 ```
 
 > **What you'll see:** the request crossing into C++. After this, the C++
@@ -343,10 +385,10 @@ The scheduler's heart is the `event_loop` while-true at
 **Print 4.1** — at the top of `event_loop` (line 841):
 
 ```python
-print(f"[TS][sched] tick begin "
+ts_log(f"[TS][sched] tick begin "
       f"waiting={self.scheduler.waiting_size()} "
       f"decoding={self.scheduler.decoding_size()} "
-      f"avail_pages={self.scheduler.available_kv_pages()}", flush=True)
+      f"avail_pages={self.scheduler.available_kv_pages()}")
 ```
 
 **Print 4.2** — right after `execution_plan = self.scheduler.next_execution_plan()`
@@ -355,32 +397,137 @@ print(f"[TS][sched] tick begin "
 ```python
 fwd = execution_plan.forward
 cache = execution_plan.cache
-print(f"[TS][sched] plan forward_ops={len(fwd)} cache_ops={len(cache)} "
-      f"req_ids={[op.id for op in (fwd[0].operations if fwd else [])]}",
-      flush=True)
+ts_log(
+    f"[TS][sched] plan forward_ops={len(fwd)} cache_ops={len(cache)} "
+    f"req_ids={list(fwd[0].request_ids) if fwd else []}"
+)
 ```
 
-**Print 4.3** — in `_get_forward_op` once `forward_op` is decided (a
-prefill chunk vs a decode batch):
+**Print 4.3** — at the end of `_get_forward_op`, just before the
+non-`None` return:
 
 ```python
-if forward_op is not None:
-    print(f"[TS][sched] forward_op type={type(forward_op).__name__} "
-          f"batch_size={len(forward_op.request_ids)} "
-          f"num_tokens={getattr(forward_op, 'num_tokens', '?')}", flush=True)
+forward_op = forward_ops[0]
+ts_log(
+    f"[TS][sched] forward_op type={type(forward_op).__name__} "
+    f"batch_size={len(forward_op.request_ids)} "
+    f"num_extends={forward_op.num_extends()}"
+)
+return forward_op
 ```
 
 **Print 4.4** — at the very end of the tick, after `advance_forward`:
 
 ```python
-print(f"[TS][sched] tick end "
-      f"changes={len(request_changes)}", flush=True)
+ts_log(f"[TS][sched] tick end "
+      f"changes={len(request_changes)}")
 ```
 
 > **What you'll see:** the tick rate, plan composition, and how many request
 > changes the FSM applied. If you see prefill chunks and decode batches
 > alternating you've understood **chunked prefill**: long prompts are split
 > across ticks so decode latency on other requests doesn't suffer.
+
+---
+
+#### Phase 10 (engine half) — Output return path
+
+After the model forward returns, three things still have to happen on
+the engine side: the scheduler-process commits the new tokens
+(`_commit_forward_results`), the frontend `OutputProcessor` fans them
+out to per-request collector queues, and the HTTP route emits the SSE
+chunks to the client.
+
+The two upstream prints in this same chain — **logits** computation
+(`LogitsProcessor.forward`) and the **sampler**
+(`GreedySamplingBackend.sample`) — live one layer up each: see
+§ 4.3 Phase M-logits and § 4.2 Phase R-sampler. They feed into the
+`ExtendResult` / `Finish` events that this section commits.
+
+- **File:** `python/tokenspeed/runtime/engine/event_loop.py:709–731`
+  (`_commit_forward_results`).
+- **File:** `python/tokenspeed/runtime/engine/output_processor.py:110+`
+  (`OutputProcessor.handle_batch_output`).
+- **File:** `python/tokenspeed/runtime/engine/async_llm.py:704+`
+  (`AsyncLLM.handle_loop`, the receive side of `_result_dispatcher`).
+- **File:** `python/tokenspeed/runtime/entrypoints/openai/serving_chat.py:713+`
+  (the chat-completion SSE generator).
+
+**Print 10.3** — in `event_loop._commit_forward_results` after request
+changes are computed:
+
+```python
+ts_log(
+    f"[TS][output] commit forward_mode={forward_mode.name} "
+    f"changes={len(request_changes)}"
+)
+```
+
+**Print 10.4** — top of `OutputProcessor.handle_batch_output`:
+
+```python
+ts_log(
+    f"[TS][output] handle_batch_output kind={type(recv_obj).__name__} "
+    f"size={len(recv_obj.rids)}"
+)
+```
+
+**Print 10.5** — in `AsyncLLM.handle_loop` right after a frame is
+received from the detokenizer ZMQ:
+
+```python
+ts_log(f"[TS][output] dispatch kind={type(recv_obj).__name__}")
+```
+
+**Print 10.6** — in the chat-completion SSE generator
+(`serving_chat.py`), once per yielded chunk:
+
+```python
+ts_log(
+    f"[TS][http] SSE rid={content['meta_info'].get('id', '?')} "
+    f"text_len={len(content.get('text', ''))} "
+    f"finish={(content['meta_info'].get('finish_reason') or {}).get('type')}"
+)
+```
+
+> **What you'll see end-to-end for one token (engine layer only):**
+>
+> ```
+> [TS][http] POST /v1/chat/completions ...
+> [TS][async] generate_request rid=...
+> [TS][async] tokenized rid=... -> N tokens
+> [TS][async] PUSH rid=... -> scheduler ZMQ
+> [TS][sched] poll new reqs
+> [TS][sched] recv rid=... state=WAITING
+> [TS][sched] handoff to C++ rid=...
+> [TS][sched] C++ Scheduler.SubmitRequests batch=1
+> [TS][sched] tick begin waiting=1 decoding=0 ...
+> [TS][sched] plan forward_ops=1 cache_ops=0
+> [TS][sched] forward_op type=PrefillForwardOp bs=1
+> [TS][output] commit forward_mode=EXTEND changes=N
+> [TS][output] handle_batch_output kind=BatchTokenIDOut size=1
+> [TS][output] dispatch kind=BatchTokenIDOut
+> [TS][http] SSE rid=... text_len=L finish=None
+> ```
+>
+> Lines starting with `[TS][exec]`, `[TS][model]`, `[TS][attn]`,
+> `[TS][triton]`, `[TS][logits]`, or `[TS][sampler]` belong to layers
+> 4.2–4.4 and will interleave between the `[TS][sched] forward_op …`
+> and `[TS][output] commit …` lines once those layers are also
+> instrumented.
+
+---
+
+### 4.2 Runtime layer
+
+The dispatch glue between scheduler plan and model forward: how a plan
+becomes GPU tensors, when CUDA graphs replay, which kernel is selected,
+and how sampled tokens leave the worker.
+
+**Phases:** 5, 6, R-cuda, R-registry, plus 10.2 (sampler).
+
+**Status:** prints not yet wired into the source — coming in the next
+iteration.
 
 ---
 
@@ -397,17 +544,17 @@ TP ranks the dispatch happens via `torch.distributed` broadcast.
 **Print 5.1** — top of `_dispatch_forward`:
 
 ```python
-print(f"[TS][exec] dispatch forward "
+ts_log(f"[TS][exec] dispatch forward "
       f"mode={forward_op.forward_mode.name if hasattr(forward_op,'forward_mode') else '?'} "
-      f"bs={len(forward_op.request_ids)}", flush=True)
+      f"bs={len(forward_op.request_ids)}")
 ```
 
 **Print 5.2** — at the top of `ModelExecutor._forward_step` (line ~361):
 
 ```python
-print(f"[TS][exec] _forward_step batch_size={batch.batch_size} "
+ts_log(f"[TS][exec] _forward_step batch_size={batch.batch_size} "
       f"num_tokens={batch.input_ids.numel()} "
-      f"forward_mode={batch.forward_mode.name}", flush=True)
+      f"forward_mode={batch.forward_mode.name}")
 ```
 
 > **What you'll see:** the boundary where the scheduler hands the GPU work
@@ -430,18 +577,93 @@ write), `req_pool_indices`, `seq_lens`.
 **Print 6.1** — at the bottom of `fill_input_buffers` once tensors exist:
 
 ```python
-print(f"[TS][exec] fill_input_buffers "
+ts_log(f"[TS][exec] fill_input_buffers "
       f"input_ids.shape={tuple(input_ids.shape)} "
       f"positions.range=({int(positions.min())},{int(positions.max())}) "
       f"out_cache_loc.shape={tuple(out_cache_loc.shape)} "
-      f"seq_lens={seq_lens.tolist()[:8]}{'...' if len(seq_lens)>8 else ''}",
-      flush=True)
+      f"seq_lens={seq_lens.tolist()[:8]}{'...' if len(seq_lens)>8 else ''}")
 ```
 
 > **What you'll see:** the exact tensors the model is about to consume —
 > particularly `out_cache_loc`, which tells you which KV-pool slots will
 > receive the new K/V vectors this step. This is *the* critical piece of
 > paged attention.
+
+---
+
+#### Phase R-cuda — CUDA-graph replay
+
+For decode-only batches the engine captures a graph per supported batch
+size and replays it. Replay skips Python entirely, so any model-side
+prints inside captured regions fire only at capture time, not at replay.
+
+- **File:** `python/tokenspeed/runtime/execution/cuda_graph_wrapper.py:228–420`
+
+**Print R-cuda** — top of `CudaGraphWrapper.replay`:
+
+```python
+ts_log(
+    f"[TS][cuda_graph] replay bs={bs} "
+    f"captured_sizes={sorted(self._captured_bs)}"
+)
+```
+
+> **Note for learning:** during graph capture, your `ts_log(...)`
+> statements in the model forward will fire during capture (once per
+> graph), then **not fire on replay**. Run with `--disable-cuda-graph`
+> first to see per-step prints; re-enable it later to compare timings.
+
+#### Phase R-registry — Kernel registry resolves to Triton
+
+`tokenspeed_kernel.selection.SelectedKernel` is the resolver that picks
+the highest-priority kernel whose capability requirements and traits
+match the running platform (see § 6 for the resolution rules).
+
+- **File:** `tokenspeed-kernel/python/tokenspeed_kernel/selection.py`
+
+**Print R-registry** — in the `select` method, after the final selection:
+
+```python
+ts_log(
+    f"[TS][registry] select family={family} solution={op_name} "
+    f"-> {chosen.name} (priority={chosen.priority})"
+)
+```
+
+This prints once per unique `(family, op, traits)` tuple at first call —
+exactly what you want for "did the right kernel win?"
+
+#### Phase R-sampler (== Phase 10.2) — Sampling backend
+
+Turns logits into next-token ids. On greedy this is one `argmax`; on
+flashinfer this is a fused top-k/top-p + categorical kernel.
+
+- **File:** `python/tokenspeed/runtime/sampling/backends/greedy.py:153–179`
+
+**Print 10.2** — top of `GreedySamplingBackend.sample`:
+
+```python
+ts_log(
+    f"[TS][sampler] greedy.sample logits.shape={tuple(logits.shape)} "
+    f"argmax_first5={logits.argmax(-1)[:5].tolist()}"
+)
+```
+
+> **What you'll see:** the sampled token id(s) for each request in the
+> batch. Compare against the model output (Phase 7) and you can spot
+> degenerate sampling (e.g. all-zero logits → token 0 every time).
+
+---
+
+### 4.3 Model layer
+
+The `nn.Module` forward path: `ModelRunner` → decoder layers → MLP →
+`PagedAttention` wrapper → `LogitsProcessor`.
+
+**Phases:** 7, 8.1, plus 10.1 (logits).
+
+**Status:** prints not yet wired into the source — coming in the next
+iteration.
 
 ---
 
@@ -464,19 +686,18 @@ x → RMSNorm → QKV projection → RoPE → PagedAttention → output proj →
 (`execution/model_runner.py:115`):
 
 ```python
-print(f"[TS][model] ModelRunner.forward "
+ts_log(f"[TS][model] ModelRunner.forward "
       f"input_ids.shape={tuple(input_ids.shape)} "
-      f"is_capture={get_is_capture_mode() if 'get_is_capture_mode' in globals() else 'n/a'}",
-      flush=True)
+      f"is_capture={get_is_capture_mode() if 'get_is_capture_mode' in globals() else 'n/a'}")
 ```
 
 **Print 7.2** — inside `LlamaAttention.forward` (the per-layer self-attn),
 just *before* `self.attn(q, k, v, ...)` is called:
 
 ```python
-print(f"[TS][model] layer={self.layer_id} pre-attn "
+ts_log(f"[TS][model] layer={self.layer_id} pre-attn "
       f"q.shape={tuple(q.shape)} k.shape={tuple(k.shape)} "
-      f"v.shape={tuple(v.shape)}", flush=True)
+      f"v.shape={tuple(v.shape)}")
 ```
 
 > **Why guard with `layer_id == 0`?** A 28-layer model with one decode
@@ -488,8 +709,8 @@ print(f"[TS][model] layer={self.layer_id} pre-attn "
 
 ```python
 if self.layer_id == 0:
-    print(f"[TS][model][L0] mlp out.shape={tuple(out.shape)} "
-          f"out.norm={out.norm():.4f}", flush=True)
+    ts_log(f"[TS][model][L0] mlp out.shape={tuple(out.shape)} "
+          f"out.norm={out.norm():.4f}")
 ```
 
 > **What you'll see:** the model is just a Python orchestration of layer
@@ -498,60 +719,116 @@ if self.layer_id == 0:
 
 ---
 
-### PHASE 8 — Attention backend dispatch (Python wrapper)
+#### Phase 8.1 — `PagedAttention.forward` dispatch (model-side wrapper)
 
-`PagedAttention.forward` (`layers/paged_attention.py:59–89`) just delegates
-to `ctx.attn_backend.forward(...)`. The base
-`AttentionBackend.forward` (`layers/attention/backends/base.py:113–163`)
-splits decode vs extend and calls one of `forward_decode` or `forward_extend`.
+`PagedAttention.forward` (`layers/paged_attention.py:59–89`) is the
+thin model-side wrapper that delegates to `ctx.attn_backend.forward(...)`.
+It carries the `layer_id` and current forward mode, but does no
+arithmetic itself — the kernel-side dispatch lives in § 4.4.
 
-For us that's `TritonAttnBackend.forward_decode` / `forward_extend` in
-`layers/attention/backends/triton.py:719–819`.
+- **File:** `python/tokenspeed/runtime/layers/paged_attention.py:59`
 
-**Print 8.1** — top of `PagedAttention.forward`
-(`layers/paged_attention.py:59`):
+**Print 8.1** — top of `PagedAttention.forward`:
 
 ```python
-print(f"[TS][attn] PagedAttention layer={self.layer_id} "
-      f"backend={type(ctx.attn_backend).__name__} "
-      f"mode={ctx.forward_mode.name}", flush=True)
+ts_log(
+    f"[TS][attn] PagedAttention layer={self.layer_id} "
+    f"backend={type(ctx.attn_backend).__name__} "
+    f"mode={ctx.forward_mode.name}"
+)
 ```
+
+> **Tip:** gate this with `if self.layer_id == 0:` so a 28-layer model
+> doesn't print 28 lines per token.
+
+#### Phase M-logits (== Phase 10.1) — `LogitsProcessor.forward`
+
+After the last decoder layer you have a `hidden_states` tensor.
+`LogitsProcessor.forward` prunes to the last token of each sequence,
+runs the LM-head matmul, and returns logits.
+
+- **File:** `python/tokenspeed/runtime/layers/logits_processor.py:157+`
+
+**Print 10.1** — top of `LogitsProcessor.forward`:
+
+```python
+ts_log(
+    f"[TS][logits] forward hidden.shape={tuple(hidden_states.shape)} "
+    f"prune_indices.numel="
+    f"{prune_indices.numel() if prune_indices is not None else 'all'}"
+)
+```
+
+> **What you'll see:** the hidden-state shape and how many tokens are
+> being pruned out. For decode this is `[bs, hidden]` (one token per
+> request). For prefill it's `[total_tokens, hidden]` and only the last
+> token of each sequence's hidden is kept.
+
+---
+
+### 4.4 Kernel layer
+
+The attention-backend wrapper that branches decode vs extend, the
+`TritonAttnBackend` wrappers, the `@triton.jit` kernels themselves, and
+the `tl.device_print` GPU-side hooks.
+
+**Phases:** 8.2-8.5, 9.
+
+**Status:** prints not yet wired into the source — coming in the next
+iteration.
+
+---
+
+### PHASE 8 (kernel half) — Attention backend dispatch (kernel-side wrappers)
+
+The base `AttentionBackend.forward` (`layers/attention/backends/base.py:113–163`)
+splits decode vs extend and calls one of `forward_decode` or
+`forward_extend`. For us that's `TritonAttnBackend.forward_decode` /
+`forward_extend` in `layers/attention/backends/triton.py:719–819`.
 
 **Print 8.2** — inside `AttentionBackend.forward` (base.py:113), right at
 the branch point:
 
 ```python
-print(f"[TS][attn] {type(self).__name__}.forward branch="
-      f"{'decode' if forward_mode.is_decode() else 'extend'}", flush=True)
+ts_log(
+    f"[TS][attn] {type(self).__name__}.forward branch="
+    f"{'decode' if forward_mode.is_decode() else 'extend'}"
+)
 ```
 
 **Print 8.3** — at the top of `TritonAttnBackend.forward_decode`
 (`backends/triton.py:772`):
 
 ```python
-print(f"[TS][attn][triton] forward_decode q.shape={tuple(q.shape)} "
-      f"qk_dim={layer.qk_head_dim} v_dim={layer.v_head_dim} "
-      f"save_kv={save_kv_cache} "
-      f"sliding_window={layer.sliding_window_size}", flush=True)
+ts_log(
+    f"[TS][attn][triton] forward_decode q.shape={tuple(q.shape)} "
+    f"qk_dim={layer.qk_head_dim} v_dim={layer.v_head_dim} "
+    f"save_kv={save_kv_cache} "
+    f"sliding_window={layer.sliding_window_size}"
+)
 ```
 
 **Print 8.4** — at the top of `TritonAttnBackend.forward_extend`
 (`backends/triton.py:719`):
 
 ```python
-print(f"[TS][attn][triton] forward_extend q.shape={tuple(q.shape)} "
-      f"max_extend_len={self.forward_metadata.max_extend_len} "
-      f"qo_indptr.numel={self.forward_metadata.qo_indptr.numel() if self.forward_metadata.qo_indptr is not None else 0}",
-      flush=True)
+ts_log(
+    f"[TS][attn][triton] forward_extend q.shape={tuple(q.shape)} "
+    f"max_extend_len={self.forward_metadata.max_extend_len} "
+    f"qo_indptr.numel="
+    f"{self.forward_metadata.qo_indptr.numel() if self.forward_metadata.qo_indptr is not None else 0}"
+)
 ```
 
 **Print 8.5** — right after `set_kv_buffer` in either branch (writing K/V
 into the paged pool):
 
 ```python
-print(f"[TS][attn][triton] set_kv_buffer layer={layer.layer_id} "
-      f"out_cache_loc.shape={tuple(out_cache_loc.shape)} "
-      f"k.shape={tuple(k.shape)}", flush=True)
+ts_log(
+    f"[TS][attn][triton] set_kv_buffer layer={layer.layer_id} "
+    f"out_cache_loc.shape={tuple(out_cache_loc.shape)} "
+    f"k.shape={tuple(k.shape)}"
+)
 ```
 
 > **What you'll see:** the moment the freshly-computed K/V is appended into
@@ -578,10 +855,10 @@ partial logits + LSE, stage 2 reduces them.
 **Print 9.1** — at the top of `_decode_att_m_fwd` (the host-side launcher):
 
 ```python
-print(f"[TS][triton][decode] launch grid=(B={cache_seqlens.shape[0]}, "
+ts_log(f"[TS][triton][decode] launch grid=(B={cache_seqlens.shape[0]}, "
       f"H={q.shape[1]}, MAX_KV_SPLITS={max_kv_splits}) "
       f"BLOCK_DMODEL={triton.next_power_of_2(k_buffer.shape[-1])} "
-      f"page_size={page_size}", flush=True)
+      f"page_size={page_size}")
 ```
 
 > **What you'll see:** the three-dim grid `(batch, heads, kv_splits)`. This
@@ -603,11 +880,10 @@ print(f"[TS][triton][decode] launch grid=(B={cache_seqlens.shape[0]}, "
 **Print 9.2** — at the top of `prefill_attention_fwd`:
 
 ```python
-print(f"[TS][triton][prefill] launch q.shape={tuple(q.shape)} "
+ts_log(f"[TS][triton][prefill] launch q.shape={tuple(q.shape)} "
       f"k.shape={tuple(k.shape)} v.shape={tuple(v.shape)} "
       f"max_extend_len={max_extend_len} "
-      f"causal={is_causal} sliding_window={sliding_window_size}",
-      flush=True)
+      f"causal={is_causal} sliding_window={sliding_window_size}")
 ```
 
 #### 9c. Inside the GPU kernel (be careful)
@@ -642,103 +918,48 @@ The `if` guard is critical — without it you'll print thousands of times.
 
 ---
 
-### PHASE 10 — Logits, sampling, and the output return path
+### 4.5 End-to-end timeline (all four layers interleaved)
 
-After the last decoder layer you have a `hidden_states` tensor. Steps:
+Once every layer is instrumented and `TS_TRACE=1` is set, one generated
+token produces this sequence (engine + runtime + model + kernel
+prints, in dispatch order):
 
-1. **LogitsProcessor.forward** prunes to the last token of each sequence,
-   does the LM-head matmul, and returns logits.
-   - File: `python/tokenspeed/runtime/layers/logits_processor.py:157+`
-2. **SamplingBackend.sample** turns logits into next-token ids.
-   - File: `python/tokenspeed/runtime/sampling/backends/greedy.py:153–179`
-3. Tokens go back to the scheduler-process side as a `forward.ExtendResult`
-   or `forward.Finish` event.
-4. `_commit_forward_results` (`event_loop.py:708–731`) calls the output
-   processor; `OutputProcesser.handle_batch_output` detokenizes and emits
-   `BatchTokenIDOut` or `BatchStrOut` over ZMQ to the frontend.
-5. `AsyncLLM._result_dispatcher` puts the chunk on the per-rid asyncio queue;
-   the HTTP route reads it and emits an SSE chunk.
-
-**Print 10.1** — top of `LogitsProcessor.forward`:
-
-```python
-print(f"[TS][logits] forward hidden.shape={tuple(hidden_states.shape)} "
-      f"prune_indices.numel={prune_indices.numel() if prune_indices is not None else 'all'}",
-      flush=True)
+```
+[TS][http] POST /v1/chat/completions ...                  # 4.1 / 1.1
+[TS][async] generate_request rid=...                      # 4.1 / 2.1
+[TS][async] tokenized rid=... -> N tokens                 # 4.1 / 2.2
+[TS][async] PUSH rid=... -> scheduler ZMQ                 # 4.1 / 2.3
+[TS][sched] poll new reqs                                 # 4.1 / 3.1
+[TS][sched] recv rid=... state=WAITING                    # 4.1 / 3.2
+[TS][sched] handoff to C++ rid=...                        # 4.1 / 3.3
+[TS][sched] C++ Scheduler.SubmitRequests batch=1          # 4.1 / 3.4
+[TS][sched] tick begin waiting=1 decoding=0 ...           # 4.1 / 4.1
+[TS][sched] plan forward_ops=1 cache_ops=0                # 4.1 / 4.2
+[TS][sched] forward_op type=PrefillForwardOp bs=1         # 4.1 / 4.3
+[TS][exec]  dispatch forward mode=EXTEND                  # 4.2 / 5.1
+[TS][exec]  _forward_step ...                             # 4.2 / 5.2
+[TS][exec]  fill_input_buffers ...                        # 4.2 / 6.1
+[TS][cuda_graph] replay bs=1 ...                          # 4.2 / R-cuda
+[TS][registry] select family=attention -> triton_*        # 4.2 / R-registry
+[TS][model] ModelRunner.forward ...                       # 4.3 / 7.1
+[TS][model][L0] pre-attn ...                              # 4.3 / 7.2
+[TS][attn]  PagedAttention layer=0 backend=TritonAttn...  # 4.3 / 8.1
+[TS][attn]  TritonAttnBackend.forward branch=extend       # 4.4 / 8.2
+[TS][attn][triton] forward_extend ...                     # 4.4 / 8.4
+[TS][attn][triton] set_kv_buffer ...                      # 4.4 / 8.5
+[TS][triton][prefill] launch ...                          # 4.4 / 9.2
+[TS][logits]  forward ...                                 # 4.3 / 10.1
+[TS][sampler] greedy.sample ...                           # 4.2 / 10.2
+[TS][output]  commit forward_mode=EXTEND changes=N        # 4.1 / 10.3
+[TS][sched]   tick end changes=N                          # 4.1 / 4.4
+[TS][output]  handle_batch_output kind=BatchTokenIDOut    # 4.1 / 10.4
+[TS][output]  dispatch kind=BatchTokenIDOut               # 4.1 / 10.5
+[TS][http]    SSE rid=... text_len=L finish=None          # 4.1 / 10.6
 ```
 
-**Print 10.2** — top of `GreedySamplingBackend.sample`
-(`sampling/backends/greedy.py:153`):
-
-```python
-print(f"[TS][sampler] greedy.sample logits.shape={tuple(logits.shape)} "
-      f"argmax_first5={logits.argmax(-1)[:5].tolist()}", flush=True)
-```
-
-**Print 10.3** — in `event_loop._commit_forward_results` after tokens are
-gathered for output:
-
-```python
-print(f"[TS][output] commit batch tokens={[t for t in new_tokens[:8]]}{'...' if len(new_tokens)>8 else ''} "
-      f"finished_rids={finished_rids}", flush=True)
-```
-
-**Print 10.4** — in `OutputProcesser.handle_batch_output` (top of method):
-
-```python
-print(f"[TS][output] handle_batch_output kind={type(batch).__name__} "
-      f"size={len(batch.rids) if hasattr(batch,'rids') else '?'}", flush=True)
-```
-
-**Print 10.5** — in `AsyncLLM._result_dispatcher` (bottom of file, around
-line 227–245), right after a chunk lands on the per-rid queue:
-
-```python
-print(f"[TS][output] dispatch rid={rid} -> queue (kind={type(payload).__name__})",
-      flush=True)
-```
-
-**Print 10.6** — back in the HTTP streaming generator
-(`http_server.py` `/v1/chat/completions` SSE loop):
-
-```python
-print(f"[TS][http] SSE chunk rid={rid} "
-      f"delta_text={chunk.choices[0].delta.content!r}", flush=True)
-```
-
-> **What you'll see end-to-end for one token:**
->
-> ```
-> [TS][http] POST /v1/chat/completions ...
-> [TS][async] generate_request rid=...
-> [TS][async] tokenized rid=...
-> [TS][async] PUSH rid=... -> scheduler ZMQ
-> [TS][sched] poll new reqs
-> [TS][sched] recv rid=... state=WAITING
-> [TS][sched] handoff to C++ rid=...
-> [TS][sched] C++ Scheduler.SubmitRequests batch=1
-> [TS][sched] tick begin waiting=1 decoding=0 ...
-> [TS][sched] plan forward_ops=1 cache_ops=0
-> [TS][sched] forward_op type=PrefillForwardOp bs=1
-> [TS][exec] dispatch forward mode=EXTEND
-> [TS][exec] _forward_step ...
-> [TS][exec] fill_input_buffers ...
-> [TS][model] ModelRunner.forward ...
-> [TS][model][L0] pre-attn ...
-> [TS][attn] PagedAttention layer=0 backend=TritonAttnBackend
-> [TS][attn][triton] forward_extend ...
-> [TS][attn][triton] set_kv_buffer ...
-> [TS][triton][prefill] launch ...
-> [TS][logits] forward ...
-> [TS][sampler] greedy.sample ...
-> [TS][output] commit batch tokens=[...]
-> [TS][output] handle_batch_output ...
-> [TS][output] dispatch rid=... -> queue
-> [TS][http] SSE chunk rid=... delta_text='Hello'
-> ```
->
-> Every line is one round-trip stage. If a stage is missing, that's where to
-> look.
+Every line is one round-trip stage, tagged with the layer (4.1–4.4) and
+the phase number that produces it. If a stage is missing, that's where
+to look.
 
 ---
 
@@ -758,13 +979,8 @@ the Triton kernel uses to gather scattered K/V into a contiguous block.
 `out_cache_loc` (Phase 6) is the flat list of page slots receiving the new
 tokens *this step*.
 
-**Print:** in `BaseTokenToKVPool.set_kv_buffer` (find via
-`grep -n "def set_kv_buffer" python/tokenspeed/runtime/layers/attention/kv_cache/`):
-
-```python
-print(f"[TS][kv] set_kv_buffer L={layer.layer_id} "
-      f"loc[:5]={loc[:5].tolist()} k.shape={tuple(k.shape)}", flush=True)
-```
+For a print on every KV append see § 4.4 Print 8.5
+(`set_kv_buffer`).
 
 ### 5.2 CUDA graphs
 
@@ -774,17 +990,11 @@ launch overhead dominates at decode.
 
 - `python/tokenspeed/runtime/execution/cuda_graph_wrapper.py:228–420`
 
-**Print:** top of `CudaGraphWrapper.replay`:
-
-```python
-print(f"[TS][cuda_graph] replay bs={bs} "
-      f"captured_sizes={sorted(self._captured_bs)}", flush=True)
-```
-
-> **Note for learning:** during graph capture, your `print(...)` statements
-> in the model forward will fire during capture (once per graph), then *not
-> fire on replay* — because graph replay doesn't re-execute Python. To see
-> per-step prints, run with `--disable-cuda-graph` first.
+For a print on every replay see § 4.2 Phase R-cuda. The same caveat
+applies: during graph capture, your `ts_log(...)` statements in the
+model forward will fire during capture (once per graph), then **not
+fire on replay** — graph replay doesn't re-execute Python. To see
+per-step prints, run with `--disable-cuda-graph` first.
 
 ### 5.3 Chunked prefill
 
@@ -836,58 +1046,82 @@ On RTX 6000 Ada (SM 8.9):
 
 That's why your runs all hit the Triton path.
 
-**Print:** in `tokenspeed_kernel/selection.py` `select` method, after the
-final selection:
-
-```python
-print(f"[TS][registry] select family={family} solution={op_name} "
-      f"-> {chosen.name} (priority={chosen.priority})", flush=True)
-```
-
-This prints once per unique (family, op, traits) tuple at first call —
+For a print confirming the selection see § 4.2 Phase R-registry. It
+prints once per unique `(family, op, traits)` tuple at first call —
 exactly what you want for "did the right kernel win?"
 
 ---
 
 ## 7. Recommended print-instrumentation procedure
 
-You don't add all 22 prints at once. Do it in **three rounds** so output
-stays readable.
+Add prints **layer by layer**, not all at once. Each layer takes one
+``TS_TRACE=1`` run to verify before you move on — that way a missing
+print or unexpected order tells you exactly which layer broke.
 
-### Round A — End-to-end skeleton (8 prints)
+### Round A — § 4.1 Engine layer (the skeleton)
 
-Phases 1.1, 2.1, 3.2, 4.1, 4.2, 5.2, 7.1, 10.6.
+Wire up every print in § 4.1, set ``TS_TRACE=1``, fire one request,
+and confirm you see a complete HTTP→SSE cycle:
 
-Goal: see one full HTTP→SSE cycle in 8 lines per generated token. If any
-line is missing, you immediately know which subsystem broke.
+    [TS][http]   POST /v1/chat/completions ...
+    [TS][async]  generate_request ...
+    [TS][sched]  recv ... / handoff ... / SubmitRequests ...
+    [TS][sched]  tick begin ... / plan ... / forward_op ... / tick end ...
+    [TS][output] commit ... / handle_batch_output ... / dispatch ...
+    [TS][http]   SSE rid=...
 
-### Round B — Attention deep-dive (6 prints)
+If any of those tags is missing, you know *exactly* which subsystem
+broke. The engine layer is the biggest payoff per minute — get it
+working before going deeper.
 
-Phases 8.1 (gated to `layer_id == 0`), 8.3, 8.4, 8.5, 9.1, 9.2.
+### Round B — § 4.2 Runtime layer (executor + sampler)
 
-Goal: see the attention backend pick decode vs extend, the kernel launch
-shapes, and the KV-cache appends. Combined with Round A you can write
-out the per-token timeline of the whole engine.
+Add Phases 5, 6, R-cuda, R-registry, and R-sampler. Now between the
+``[TS][sched] forward_op`` line and the ``[TS][output] commit`` line
+you'll see ``[TS][exec] dispatch ...``, ``[TS][exec] _forward_step ...``,
+``[TS][exec] fill_input_buffers ...``, ``[TS][cuda_graph] replay ...``,
+``[TS][registry] select ...``, and ``[TS][sampler] greedy.sample ...``.
+Run with ``--disable-cuda-graph`` while wiring this round so
+``[TS][model]`` prints (next round) actually fire.
 
-### Round C — Triton GPU internals (gated `tl.device_print`)
+### Round C — § 4.3 Model layer (forward + logits)
 
-Pick **one** kernel and add 2–3 `tl.device_print` lines guarded by
-`program_id(0)==0 and program_id(1)==0 and program_id(2)==0`. Re-launch
-once with `--max-num-seqs 1` and a short prompt so the kernel fires only a
-handful of times. This is the only way to peek at the actual GPU-side state.
+Add Phases 7 (gated to ``layer_id == 0``), 8.1, and M-logits. You'll
+see one ``[TS][model] ModelRunner.forward`` per tick and one set of
+layer-0 attention/MLP shape prints. Phase M-logits gives you
+``[TS][logits] forward hidden.shape=...`` exactly once per tick.
 
-> **Triton print quirk:** `tl.device_print` flushes asynchronously. If your
-> server keeps running it'll print fine; if you Ctrl+C right after launch
-> some output may be lost.
+### Round D — § 4.4 Kernel layer (attention backends + Triton)
+
+Add Phases 8.2-8.5 (gated to ``layer_id == 0``), 9.1, and 9.2. These
+fire once per attention call, so leave the layer guard on. You'll now
+see ``[TS][attn]``, ``[TS][attn][triton]``, and
+``[TS][triton][prefill|decode] launch ...`` interleaved with the model
+prints from Round C.
+
+### Round E — In-kernel `tl.device_print` (optional)
+
+Pick **one** Triton kernel and add 2–3 ``tl.device_print`` lines guarded
+by ``program_id(0)==0 and program_id(1)==0 and program_id(2)==0``.
+Re-launch once with ``--max-num-seqs 1`` and a short prompt so the
+kernel fires only a handful of times. This is the only way to peek at
+the actual GPU-side state.
+
+> **Triton print quirk:** ``tl.device_print`` flushes asynchronously. If
+> your server keeps running it'll print fine; if you Ctrl+C right after
+> launch some output may be lost.
 
 ---
 
 ## 8. Concrete launch recipe for your RTX 6000 Ada
 
-Once you've added Round A prints:
+After wiring Round A (§ 4.1 Engine layer), enable the trace via the
+`TS_TRACE` environment variable and disable CUDA graphs while learning
+so prints fire every step:
 
 ```bash
-# Disable CUDA graphs while learning so prints fire every step
+# Engine-layer prints are wired but gated; set TS_TRACE=1 to enable.
+TS_TRACE=1 \
 tokenspeed serve Qwen/Qwen3-1.7B \
   --attention-backend triton \
   --moe-backend triton \
@@ -901,10 +1135,14 @@ tokenspeed serve Qwen/Qwen3-1.7B \
   2>&1 | tee /tmp/tokenspeed-trace.log
 ```
 
-> **Note on `--disable-cuda-graph`:** I'm using the conventional name; check
-> `tokenspeed serve --help | grep -i graph` and use whatever flag the CLI
-> actually exposes (very likely `--disable-cuda-graph` or
-> `--enable-cuda-graph false`).
+> **Note on `--disable-cuda-graph`:** check
+> `tokenspeed serve --help | grep -i graph` for the exact flag name your
+> CLI exposes. Likely candidates: `--disable-cuda-graph` or
+> `--enable-cuda-graph false`.
+
+> **`TS_TRACE` is opt-in.** Leave it unset for production runs and tests
+> — `ts_log(...)` becomes a single boolean test on a module-level flag,
+> i.e. zero meaningful overhead.
 
 Then in another terminal:
 
@@ -962,8 +1200,11 @@ TokenSpeed produces a token, all the way down to the GPU instructions."
    running 100 decode steps × 2 attn calls = 5,600 attention prints. Always
    guard with `if layer.layer_id == 0:` or `if step_idx % 16 == 0:`.
 
-2. **`flush=True` matters.** Python buffers stdout when piped to file. Use
-   `print(..., flush=True)` everywhere, or set `PYTHONUNBUFFERED=1`.
+2. **`flush=True` matters — `ts_log` already does it.** Python buffers
+   stdout when piped to file. The `ts_log` helper always passes
+   `flush=True`, so you don't need to repeat it. If you ever fall back
+   to a raw `print(...)` (e.g. while debugging the helper itself), set
+   `PYTHONUNBUFFERED=1` or pass `flush=True` yourself.
 
 3. **The scheduler/worker are separate processes.** Your prints will appear
    in a *combined* stream if you use `tee`, but the order across processes

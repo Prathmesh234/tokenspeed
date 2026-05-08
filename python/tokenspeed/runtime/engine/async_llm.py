@@ -103,6 +103,7 @@ from tokenspeed.runtime.utils.exceptions import get_exception_traceback
 from tokenspeed.runtime.utils.hf_transformers_utils import get_processor, get_tokenizer
 from tokenspeed.runtime.utils.process import kill_process_tree
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
+from tokenspeed.runtime.utils.ts_trace import ts_log
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -278,6 +279,11 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
 
         obj.normalize_batch_and_arguments()
 
+        ts_log(
+            f"[TS][async] generate_request rid={obj.rid} prompt_len="
+            f"{len(obj.input_ids) if obj.input_ids else len(obj.text or '')}"
+        )
+
         if self.enable_metrics:
             batch_size = obj.batch_size if hasattr(obj, "batch_size") else 1
             self.metrics_collector.observe_request_arrival(batch_size)
@@ -293,6 +299,11 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
             is_single = obj.is_single
             if is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
+                ts_log(
+                    f"[TS][async] tokenized rid={obj.rid} -> "
+                    f"{len(tokenized_obj.input_ids)} tokens, "
+                    f"first5={tokenized_obj.input_ids[:5]}"
+                )
                 self._send_one_request(obj, tokenized_obj, created_time)
                 async for response in self._wait_one_response(obj):
                     yield response
@@ -328,6 +339,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
             tokenized_time=tokenized_obj.created_time,
         )
         self.rid_to_state[obj.rid] = state
+        ts_log(f"[TS][async] PUSH rid={tokenized_obj.rid} -> scheduler ZMQ")
         self.engine_core_client.send_to_scheduler.send_pyobj(tokenized_obj)
 
     async def _wait_one_response(
@@ -706,6 +718,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
 
         while True:
             recv_obj = await self.engine_core_client.recv_from_detokenizer.recv_pyobj()
+            ts_log(f"[TS][output] dispatch kind={type(recv_obj).__name__}")
             self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = time.time()
 

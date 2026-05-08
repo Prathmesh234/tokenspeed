@@ -79,6 +79,7 @@ from tokenspeed.runtime.utils.exceptions import get_exception_traceback
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.process import register_usr_signal
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
+from tokenspeed.runtime.utils.ts_trace import ts_log
 
 logger = get_colorful_logger(__name__)
 
@@ -621,6 +622,7 @@ class EventLoop:
     # ------------------------------------------------------------------
 
     def _process_new_requests(self):
+        ts_log(f"[TS][sched] poll new reqs (attn_tp_rank={self.attn_tp_rank})")
         recv_reqs = self.request_handler.recv_reqs()
         new_req_specs, new_req_states, bootstrap_infos, abort_rids = (
             self.request_handler.process_requests(recv_reqs)
@@ -704,6 +706,11 @@ class EventLoop:
 
         if admitted_specs:
             self.scheduler.submit_requests(admitted_specs)
+            ts_log(
+                f"[TS][sched] C++ Scheduler.SubmitRequests "
+                f"batch={len(admitted_specs)} "
+                f"waiting_size_now={self.scheduler.waiting_size()}"
+            )
 
     @nvtx_range("loop:commit", color="rapids")
     def _commit_forward_results(
@@ -723,6 +730,10 @@ class EventLoop:
             is_prefill_instance=is_prefill_instance,
             on_first_token=on_first_token,
         )
+        ts_log(
+            f"[TS][output] commit forward_mode={forward_mode.name} "
+            f"changes={len(request_changes)}"
+        )
         # Accumulate decode stats from synced results (no GPU sync)
         if forward_op.num_extends() <= 0:
             bs = len(forward_op.request_ids)
@@ -735,7 +746,13 @@ class EventLoop:
         forward_ops = execution_plan.forward
         if len(forward_ops) == 0 or len(forward_ops[0].request_ids) == 0:
             return None
-        return forward_ops[0]
+        forward_op = forward_ops[0]
+        ts_log(
+            f"[TS][sched] forward_op type={type(forward_op).__name__} "
+            f"batch_size={len(forward_op.request_ids)} "
+            f"num_extends={forward_op.num_extends()}"
+        )
+        return forward_op
 
     def _process_pd_events(self, pd_events: list) -> list:
         processed = []
@@ -839,9 +856,21 @@ class EventLoop:
     def event_loop(self):
         """Non-overlapping scheduler loop."""
         while True:
+            ts_log(
+                f"[TS][sched] tick begin "
+                f"waiting={self.scheduler.waiting_size()} "
+                f"decoding={self.scheduler.decoding_size()} "
+                f"avail_pages={self.scheduler.available_kv_pages()}"
+            )
             self._process_new_requests()
             self._commit_cache_results()
             execution_plan = self.scheduler.next_execution_plan()
+            fwd = execution_plan.forward
+            cache = execution_plan.cache
+            ts_log(
+                f"[TS][sched] plan forward_ops={len(fwd)} cache_ops={len(cache)} "
+                f"req_ids={list(fwd[0].request_ids) if fwd else []}"
+            )
             self._submit_cache_ops(execution_plan)
 
             forward_op = self._get_forward_op(execution_plan)
@@ -885,6 +914,8 @@ class EventLoop:
 
             if request_changes:
                 advance_forward(self.scheduler, request_changes)
+
+            ts_log(f"[TS][sched] tick end changes={len(request_changes)}")
 
     def _gather_sampling_params(self, forward_op) -> list[SamplingParams]:
         """Look up per-request SamplingParams from the output processor. The

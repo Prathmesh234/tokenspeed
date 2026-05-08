@@ -52,6 +52,7 @@ from tokenspeed.runtime.engine.io_struct import (
     BatchTokenIDOut,
 )
 from tokenspeed.runtime.engine.logprobs import LogprobsProcessor
+from tokenspeed.runtime.utils.ts_trace import ts_log
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.engine.async_llm import AsyncLLM
@@ -113,6 +114,10 @@ class OutputProcessor:
             BatchStrOut | BatchEmbeddingOut | BatchMultimodalOut | BatchTokenIDOut
         ),
     ):
+        ts_log(
+            f"[TS][output] handle_batch_output kind={type(recv_obj).__name__} "
+            f"size={len(recv_obj.rids)}"
+        )
         for i, rid in enumerate(recv_obj.rids):
             state: ReqState = self.engine.rid_to_state.get(rid, None)
             if state is None:
